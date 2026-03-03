@@ -61,7 +61,7 @@
                             <i data-lucide="info" class="w-4 h-4"></i> Como utilizar
                         </h3>
                         <p class="text-indigo-700 text-[11px] leading-relaxed">
-                            Carregue o PDF do Boletim da Propriedade Industrial. O sistema irá identificar automaticamente os novos pedidos de marcas registadas e organizar os contactos.
+                            Carregue o PDF do Boletim. O sistema ignora as secções de patentes e foca-se nos <strong>Pedidos de Marcas</strong> para extrair nomes e titulares.
                         </p>
                     </div>
                 </div>
@@ -88,8 +88,9 @@
 
     <script>
         // =========================================================================
-        // CONFIGURAÇÃO DA API KEY (OCULTA DA INTERFACE)
+        // CONFIGURAÇÃO DA API KEY
         // =========================================================================
+        const apiKey = ""; // Deixar vazio se estiver a testar no Canvas
         const HARDCODED_API_KEY = "AIzaSyAIVXZN0XveD78O8HybOY85vFvteMvjr6c"; 
         // =========================================================================
 
@@ -106,7 +107,6 @@
 
         let extractedLeads = [];
 
-        // Inicializar ícones Lucide
         window.onload = () => {
             lucide.createIcons();
         };
@@ -114,10 +114,14 @@
         fileInput.addEventListener('change', handleFile);
 
         async function handleFile(e) {
-            const key = HARDCODED_API_KEY;
+            // Se existir uma chave hardcoded, usamos essa (prioritária para o GitHub)
+            // Caso contrário, tenta usar a apiKey injetada pelo ambiente
+            const finalKey = (HARDCODED_API_KEY && HARDCODED_API_KEY.trim() !== "") 
+                ? HARDCODED_API_KEY.trim() 
+                : apiKey;
             
-            if (!key) {
-                alert("Erro interno: API Key não configurada.");
+            if (!finalKey) {
+                alert("Erro interno: API Key não configurada. Por favor, insira a sua chave.");
                 return;
             }
 
@@ -128,9 +132,9 @@
             try {
                 const text = await extractTextFromPdf(file);
                 toggleLoading(true, "A processar com Inteligência Artificial...");
-                await processWithGemini(text, key);
+                await processWithGemini(text, finalKey);
             } catch (error) {
-                showError(error.message);
+                showError("Falha no processo: " + error.message);
             } finally {
                 toggleLoading(false);
             }
@@ -140,7 +144,6 @@
             const arrayBuffer = await file.arrayBuffer();
             const pdf = await pdfjsLib.getDocument({ data: arrayBuffer }).promise;
             let fullText = "";
-            // Analisamos as primeiras 100 páginas para cobrir a secção de marcas
             const numPages = Math.min(pdf.numPages, 100);
             
             for (let i = 1; i <= numPages; i++) {
@@ -153,31 +156,49 @@
         }
 
         async function processWithGemini(text, key) {
+            // Localizar secção de marcas para poupar tokens e focar no conteúdo útil
             const lowerText = text.toLowerCase();
-            const marker = lowerText.indexOf("registo nacional de marcas");
-            const relevantText = marker !== -1 ? text.substring(marker).substring(0, 50000) : text.substring(0, 50000);
+            let marker = lowerText.indexOf("registo nacional de marcas");
+            if (marker === -1) marker = lowerText.indexOf("pedidos");
+            
+            const relevantText = marker !== -1 ? text.substring(marker).substring(0, 80000) : text.substring(0, 80000);
+
+            // Se estivermos a usar a chave hardcoded do utilizador, usamos o modelo estável gemini-1.5-flash
+            // Se estivermos sem chave (ambiente preview), usamos o 2.5 indicado nas instruções
+            const modelName = (HARDCODED_API_KEY && HARDCODED_API_KEY.trim() !== "") 
+                ? "gemini-1.5-flash" 
+                : "gemini-2.5-flash-preview-09-2025";
 
             const payload = {
-                contents: [{ parts: [{ text: `Extrai os novos pedidos de marcas deste texto do INPI (Portugal):\n\n${relevantText}` }] }],
-                systemInstruction: { parts: [{ text: "Atua como assistente comercial. Extrai Marca, Requerente (Titular), NIF e Área de Atividade. Retorna obrigatoriamente um objeto JSON com a chave 'leads'." }] },
+                contents: [{ parts: [{ text: `Extrai TODOS os novos PEDIDOS de marcas deste texto do INPI Portugal. Retorna um JSON com a chave 'leads'. Para cada lead: marca, requerente, nif e area. Texto:\n\n${relevantText}` }] }],
+                systemInstruction: { parts: [{ text: "Atua como assistente comercial. Retorna APENAS o JSON solicitado." }] },
                 generationConfig: { 
                     responseMimeType: "application/json",
                     temperature: 0.1
                 }
             };
 
-            const fetchWithRetry = async (url, options, retries = 3) => {
+            const fetchWithRetry = async (url, options, retries = 5) => {
                 for (let i = 0; i < retries; i++) {
                     const response = await fetch(url, options);
                     if (response.ok) return response;
-                    if (i < retries - 1) await new Promise(r => setTimeout(r, 2000));
+                    
+                    const errorData = await response.json().catch(() => ({}));
+                    const errorMsg = errorData.error?.message || response.statusText;
+
+                    if (i < retries - 1 && (response.status === 429 || response.status >= 500)) {
+                        const waitTime = Math.pow(2, i) * 1000;
+                        progressText.innerText = `A tentar novamente em ${waitTime/1000}s...`;
+                        await new Promise(r => setTimeout(r, waitTime));
+                    } else {
+                        throw new Error(`A API devolveu o erro ${response.status}: ${errorMsg}`);
+                    }
                 }
-                throw new Error("Não foi possível obter resposta da IA. Tente novamente em instantes.");
             };
 
             try {
                 const response = await fetchWithRetry(
-                    `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash-preview-09-2025:generateContent?key=${key}`,
+                    `https://generativelanguage.googleapis.com/v1beta/models/${modelName}:generateContent?key=${key}`,
                     {
                         method: 'POST',
                         headers: { 'Content-Type': 'application/json' },
@@ -187,13 +208,16 @@
 
                 const result = await response.json();
                 const jsonText = result.candidates?.[0]?.content?.parts?.[0]?.text;
+                if (!jsonText) throw new Error("A IA não gerou uma resposta válida.");
+                
                 const parsed = JSON.parse(jsonText);
                 extractedLeads = parsed.leads || [];
 
                 if (extractedLeads.length === 0) showError("Nenhuma marca nova encontrada no texto fornecido.");
                 else renderLeads(extractedLeads);
             } catch (err) {
-                showError("Erro no processamento: " + err.message);
+                console.error(err);
+                showError(err.message);
             }
         }
 
@@ -243,11 +267,11 @@
             resultsGrid.classList.add('hidden');
             exportBtn.classList.add('hidden');
             statusMessage.innerHTML = `
-                <div class="py-8">
+                <div class="py-8 px-4">
                     <i data-lucide="alert-circle" class="w-12 h-12 text-red-400 mx-auto mb-4"></i>
-                    <p class="font-bold text-slate-700">Atenção</p>
-                    <p class="text-xs text-slate-400 mt-2 px-4">${msg}</p>
-                    <button onclick="location.reload()" class="mt-6 text-indigo-600 text-xs font-bold underline">Tentar novamente</button>
+                    <p class="font-bold text-slate-700">Ocorreu um Erro</p>
+                    <p class="text-xs text-slate-400 mt-2 break-words max-w-sm mx-auto">${msg}</p>
+                    <button onclick="location.reload()" class="mt-6 text-indigo-600 text-xs font-bold border border-indigo-200 px-4 py-2 rounded-lg hover:bg-indigo-50 transition-all">Tentar novamente</button>
                 </div>
             `;
             lucide.createIcons();
