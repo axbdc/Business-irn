@@ -51,18 +51,18 @@
                             <p class="text-slate-600 font-medium">Arraste o PDF do IRN aqui</p>
                             <p class="text-slate-400 text-sm mt-1">ou clique para selecionar</p>
                         </div>
-                        <div id="processingIcon" class="hidden">
+                        <div id="processingIcon" class="hidden text-center">
                             <i data-lucide="loader-2" class="w-16 h-16 mx-auto mb-4 text-indigo-500 animate-spin"></i>
-                            <p class="text-indigo-600 font-bold">A ler PDF...</p>
+                            <p id="progressText" class="text-indigo-600 font-bold">A ler PDF...</p>
                         </div>
                     </div>
 
                     <div class="mt-8 p-4 bg-amber-50 rounded-xl border border-amber-100">
                         <h3 class="text-amber-800 font-bold text-sm flex items-center gap-2 mb-2">
-                            <i data-lucide="info" class="w-4 h-4"></i> Como funciona?
+                            <i data-lucide="info" class="w-4 h-4"></i> Problemas na leitura?
                         </h3>
                         <p class="text-amber-700 text-xs leading-relaxed">
-                            O site lê o PDF, utiliza Inteligência Artificial para identificar as novas marcas e cria links automáticos para o portal do INPI para encontrar os contactos.
+                            Se o PDF for uma imagem (digitalizado), o site pode ter dificuldade. Tente copiar o texto manualmente e usar a ferramenta de "Análise de Texto" se necessário.
                         </p>
                     </div>
                 </div>
@@ -97,6 +97,7 @@
         const dropZone = document.getElementById('dropZone');
         const uploadIcon = document.getElementById('uploadIcon');
         const processingIcon = document.getElementById('processingIcon');
+        const progressText = document.getElementById('progressText');
         const resultsGrid = document.getElementById('resultsGrid');
         const statusMessage = document.getElementById('statusMessage');
         const exportBtn = document.getElementById('exportBtn');
@@ -109,13 +110,18 @@
             const file = e.target.files[0];
             if (!file) return;
 
-            toggleLoading(true);
+            toggleLoading(true, "A ler o PDF...");
             try {
                 const text = await extractTextFromPdf(file);
+                if (!text || text.trim().length < 50) {
+                    throw new Error("O PDF parece estar vazio ou é uma imagem digitalizada.");
+                }
+                
+                toggleLoading(true, "A IA está a organizar as leads...");
                 await processWithGemini(text);
             } catch (error) {
-                console.error(error);
-                showError("Erro ao processar o ficheiro. Verifique se o PDF é válido.");
+                console.error("Erro no fluxo:", error);
+                showError(error.message || "Erro ao processar o ficheiro.");
             } finally {
                 toggleLoading(false);
             }
@@ -126,39 +132,62 @@
             const pdf = await pdfjsLib.getDocument({ data: arrayBuffer }).promise;
             let fullText = "";
             
-            // Lemos as primeiras 10 páginas (geralmente suficiente para os editais)
-            const numPages = Math.min(pdf.numPages, 10);
+            // Lemos até 15 páginas
+            const numPages = Math.min(pdf.numPages, 15);
             for (let i = 1; i <= numPages; i++) {
                 const page = await pdf.getPage(i);
                 const content = await page.getTextContent();
-                fullText += content.items.map(item => item.str).join(" ") + "\n";
+                const pageText = content.items.map(item => item.str).join(" ");
+                fullText += pageText + "\n";
             }
             return fullText;
         }
 
         async function processWithGemini(text) {
-            const prompt = `Analisa este texto de registo de marcas do IRN. Extrai uma lista organizada das NOVAS MARCAS registadas.
-            Para cada marca, extrai: nome da marca, nome do requerente (titular), NIF (se houver) e categoria/atividade.
-            Responde apenas com um array JSON no formato:
+            const systemPrompt = `És um especialista em prospecção de vendas B2B em Portugal.
+            O teu objetivo é analisar editais do IRN (Registo Nacional de Marcas) e extrair os dados das NOVAS marcas publicadas.
+            
+            Regras estritas:
+            1. Ignora marcas antigas ou renovações.
+            2. Extrai: Nome da Marca, Nome do Titular/Requerente, NIF (se visível) e a Área de Atividade (ex: Vestuário, Software).
+            3. Retorna APENAS um array JSON válido.
+            4. Se não encontrares marcas, retorna um array vazio [].
+            
+            Formato de saída:
             [{"marca": "NOME", "requerente": "EMPRESA OU PESSOA", "nif": "NIF", "area": "ATIVIDADE"}]`;
 
-            const response = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash-preview-09-2025:generateContent?key=${apiKey}`, {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({
-                    contents: [{ parts: [{ text: `Processa este texto do IRN:\n\n${text}` }] }],
-                    systemInstruction: { parts: [{ text: prompt }] },
-                    generationConfig: { responseMimeType: "application/json" }
-                })
-            });
-
-            const data = await response.json();
             try {
-                const jsonText = data.candidates[0].content.parts[0].text;
+                const response = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash-preview-09-2025:generateContent?key=${apiKey}`, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({
+                        contents: [{ parts: [{ text: `Analisa este texto do IRN e extrai as leads de marcas novas:\n\n${text.substring(0, 30000)}` }] }],
+                        systemInstruction: { parts: [{ text: systemPrompt }] },
+                        generationConfig: { 
+                            responseMimeType: "application/json",
+                            temperature: 0.1
+                        }
+                    })
+                });
+
+                if (!response.ok) throw new Error("Falha na comunicação com a IA.");
+
+                const data = await response.json();
+                let jsonText = data.candidates?.[0]?.content?.parts?.[0]?.text || "[]";
+                
+                // Limpeza preventiva de possíveis blocos de código markdown na resposta
+                jsonText = jsonText.replace(/```json/g, "").replace(/```/g, "").trim();
+                
                 extractedLeads = JSON.parse(jsonText);
-                renderLeads(extractedLeads);
+
+                if (extractedLeads.length === 0) {
+                    showError("Nenhuma marca nova foi identificada no texto fornecido.");
+                } else {
+                    renderLeads(extractedLeads);
+                }
             } catch (err) {
-                showError("A IA não conseguiu identificar dados no formato esperado.");
+                console.error("Erro no processamento IA:", err);
+                showError("A IA não conseguiu estruturar os dados. Tente um PDF com texto mais limpo.");
             }
         }
 
@@ -169,7 +198,9 @@
             resultsGrid.innerHTML = "";
 
             leads.forEach(lead => {
-                const inpiUrl = `https://servicosonline.inpi.pt/pesquisas/main/marcas.jsp?lang=PT&marca=${encodeURIComponent(lead.marca)}`;
+                const brand = lead.marca || "Desconhecida";
+                const owner = lead.requerente || "Não identificado";
+                const inpiUrl = `https://servicosonline.inpi.pt/pesquisas/main/marcas.jsp?lang=PT&marca=${encodeURIComponent(brand)}`;
                 
                 const card = document.createElement('div');
                 card.className = "bg-white p-6 rounded-3xl shadow-sm border border-slate-100 hover:shadow-xl hover:shadow-indigo-100 transition-all group";
@@ -180,19 +211,25 @@
                             <i data-lucide="external-link" class="w-5 h-5"></i>
                         </a>
                     </div>
-                    <h3 class="text-xl font-bold text-slate-800 mb-2 group-hover:text-indigo-600 transition-colors">${lead.marca}</h3>
+                    <h3 class="text-xl font-bold text-slate-800 mb-2 group-hover:text-indigo-600 transition-colors">${brand}</h3>
                     <div class="space-y-3">
                         <div class="flex items-center gap-2 text-slate-600">
                             <i data-lucide="user" class="w-4 h-4 text-slate-400"></i>
-                            <span class="text-sm font-medium">${lead.requerente}</span>
+                            <span class="text-sm font-medium">${owner}</span>
                         </div>
                         <div class="flex items-center gap-2 text-slate-500 text-xs">
                             <i data-lucide="tag" class="w-4 h-4"></i>
-                            <span>${lead.area}</span>
+                            <span>${lead.area || "Área Geral"}</span>
                         </div>
+                        ${lead.nif && lead.nif !== 'NIF' ? `
+                            <div class="flex items-center gap-2 text-slate-400 text-xs italic">
+                                <i data-lucide="hash" class="w-3 h-3"></i>
+                                <span>NIF: ${lead.nif}</span>
+                            </div>
+                        ` : ''}
                     </div>
                     <div class="mt-6 flex gap-2">
-                        <button onclick="window.open('https://www.google.com/search?q=${encodeURIComponent(lead.requerente + ' contacto email')}', '_blank')" class="flex-1 bg-slate-50 hover:bg-slate-100 text-slate-600 py-2.5 rounded-xl text-xs font-bold transition-all flex items-center justify-center gap-2">
+                        <button onclick="window.open('https://www.google.com/search?q=${encodeURIComponent(owner + ' contacto email portugal')}', '_blank')" class="flex-1 bg-slate-50 hover:bg-slate-100 text-slate-600 py-2.5 rounded-xl text-xs font-bold transition-all flex items-center justify-center gap-2">
                             <i data-lucide="search" class="w-3 h-3"></i> Google Contactos
                         </button>
                     </div>
@@ -202,34 +239,41 @@
             lucide.createIcons();
         }
 
-        function toggleLoading(isLoading) {
+        function toggleLoading(isLoading, text = "A processar...") {
             uploadIcon.classList.toggle('hidden', isLoading);
             processingIcon.classList.toggle('hidden', !isLoading);
+            progressText.innerText = text;
             dropZone.classList.toggle('pointer-events-none', isLoading);
             dropZone.classList.toggle('bg-indigo-50/30', isLoading);
         }
 
         function showError(msg) {
+            statusMessage.classList.remove('hidden');
+            resultsGrid.classList.add('hidden');
+            exportBtn.classList.add('hidden');
             statusMessage.innerHTML = `
-                <div class="text-red-500">
-                    <i data-lucide="alert-circle" class="w-12 h-12 mx-auto mb-4"></i>
-                    <p class="font-bold">${msg}</p>
-                    <button onclick="location.reload()" class="mt-4 text-sm underline">Tentar novamente</button>
+                <div class="text-slate-600 max-w-md mx-auto">
+                    <div class="w-16 h-16 bg-red-50 text-red-500 rounded-full flex items-center justify-center mx-auto mb-6">
+                        <i data-lucide="alert-circle" class="w-8 h-8"></i>
+                    </div>
+                    <p class="font-bold text-lg mb-2">Ops! Algo correu mal.</p>
+                    <p class="text-sm text-slate-400 mb-6">${msg}</p>
+                    <button onclick="location.reload()" class="bg-indigo-600 text-white px-6 py-2 rounded-xl text-sm font-semibold hover:bg-indigo-700 transition-all">Tentar novamente</button>
                 </div>
             `;
             lucide.createIcons();
         }
 
         exportBtn.onclick = () => {
-            const csv = "Marca;Requerente;NIF;Area;Link INPI\n" + 
-                extractedLeads.map(l => `${l.marca};${l.requerente};${l.nif};${l.area};https://servicosonline.inpi.pt/pesquisas/main/marcas.jsp?marca=${encodeURIComponent(l.marca)}`).join("\n");
+            const csv = "\uFEFFMarca;Requerente;NIF;Area;Link INPI\n" + 
+                extractedLeads.map(l => `"${l.marca}";"${l.requerente}";"${l.nif}";"${l.area}";"https://servicosonline.inpi.pt/pesquisas/main/marcas.jsp?marca=${encodeURIComponent(l.marca)}"`).join("\n");
             
-            const blob = new Blob([csv], { type: 'text/csv' });
+            const blob = new Blob([csv], { type: 'text/csv;charset=utf-8;' });
             const url = window.URL.createObjectURL(blob);
             const a = document.createElement('a');
             a.setAttribute('hidden', '');
             a.setAttribute('href', url);
-            a.setAttribute('download', 'leads_marcas.csv');
+            a.setAttribute('download', `leads_irn_${new Date().toISOString().slice(0,10)}.csv`);
             document.body.appendChild(a);
             a.click();
             document.body.removeChild(a);
